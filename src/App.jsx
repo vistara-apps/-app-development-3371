@@ -7,11 +7,15 @@ import ProfileForm from './components/ProfileForm';
 import RecommendationCard from './components/RecommendationCard';
 import EcoTag from './components/EcoTag';
 import PaymentModal from './components/PaymentModal';
+import ErrorBoundary from './components/ErrorBoundary';
 import { usePaymentContext } from './hooks/usePaymentContext';
 import { generateRecommendations } from './services/openai';
+import { saveUserProfile, getUserProfile, saveRecommendation, logPayment, getUserStats } from './services/supabase';
+import { identifyFarcasterUser } from './services/farcaster';
+import { enhanceRecommendations, getUserTier } from './services/businessLogic';
 
-function App() {
-  const { isConnected } = useAccount();
+function AppContent() {
+  const { isConnected, address } = useAccount();
   const { createSession } = usePaymentContext();
   
   const [userProfile, setUserProfile] = useState(null);
@@ -20,15 +24,72 @@ function App() {
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [paymentLoading, setPaymentLoading] = useState(false);
   const [freeRecommendationsUsed, setFreeRecommendationsUsed] = useState(0);
+  const [userStats, setUserStats] = useState(null);
+  const [farcasterUser, setFarcasterUser] = useState(null);
+
+  // Load user data when wallet connects
+  useEffect(() => {
+    if (isConnected && address) {
+      loadUserData();
+      identifyUser();
+    }
+  }, [isConnected, address]);
+
+  const loadUserData = async () => {
+    try {
+      const userId = address;
+      const [profile, stats] = await Promise.all([
+        getUserProfile(userId),
+        getUserStats(userId)
+      ]);
+      
+      if (profile) {
+        setUserProfile(profile.style_preferences);
+        setUserStats(stats);
+      }
+    } catch (error) {
+      console.error('Error loading user data:', error);
+    }
+  };
+
+  const identifyUser = async () => {
+    try {
+      const farcasterProfile = await identifyFarcasterUser(address);
+      setFarcasterUser(farcasterProfile);
+    } catch (error) {
+      console.error('Error identifying Farcaster user:', error);
+    }
+  };
 
   const handleProfileSubmit = async (preferences) => {
     setUserProfile(preferences);
     setLoading(true);
     
     try {
-      const newRecommendations = await generateRecommendations(preferences);
-      setRecommendations(newRecommendations);
+      // Save profile to Supabase
+      if (address) {
+        await saveUserProfile(address, preferences);
+      }
+
+      // Generate AI recommendations
+      const rawRecommendations = await generateRecommendations(preferences);
+      
+      // Enhance recommendations with business logic
+      const stats = userStats || { totalRecommendations: 0, uniqueBrands: 0, totalSpent: '$0.00' };
+      const enhancedRecommendations = enhanceRecommendations(rawRecommendations, preferences, stats);
+      
+      setRecommendations(enhancedRecommendations);
       setFreeRecommendationsUsed(1);
+
+      // Save recommendations to Supabase
+      if (address) {
+        for (const rec of enhancedRecommendations) {
+          await saveRecommendation(address, rec);
+        }
+        // Refresh user stats
+        const updatedStats = await getUserStats(address);
+        setUserStats(updatedStats);
+      }
     } catch (error) {
       console.error('Error generating recommendations:', error);
     } finally {
@@ -59,9 +120,21 @@ function App() {
   const handlePayment = async () => {
     setPaymentLoading(true);
     try {
-      await createSession();
+      const paymentResponse = await createSession();
+      
+      // Log payment to Supabase
+      if (address) {
+        await logPayment(address, '$0.50', 'wallet');
+      }
+      
       setShowPaymentModal(false);
       await generateNewRecommendations();
+      
+      // Refresh user stats after payment
+      if (address) {
+        const updatedStats = await getUserStats(address);
+        setUserStats(updatedStats);
+      }
     } catch (error) {
       console.error('Payment failed:', error);
       alert('Payment failed. Please try again.');
@@ -123,17 +196,23 @@ function App() {
                     <h3 className="text-lg font-semibold text-text-primary mb-4">Your Impact</h3>
                     <div className="space-y-3">
                       <div className="flex justify-between items-center">
-                        <span className="text-text-secondary">Recommendations viewed</span>
-                        <span className="font-semibold text-primary">{recommendations.length}</span>
+                        <span className="text-text-secondary">Total recommendations</span>
+                        <span className="font-semibold text-primary">{userStats?.totalRecommendations || 0}</span>
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-text-secondary">Eco-brands discovered</span>
-                        <span className="font-semibold text-primary">{new Set(recommendations.map(r => r.brandName)).size}</span>
+                        <span className="font-semibold text-primary">{userStats?.uniqueBrands || 0}</span>
                       </div>
                       <div className="flex justify-between items-center">
-                        <span className="text-text-secondary">Free recommendations left</span>
-                        <span className="font-semibold text-accent">{Math.max(0, 1 - freeRecommendationsUsed)}</span>
+                        <span className="text-text-secondary">Total invested</span>
+                        <span className="font-semibold text-accent">{userStats?.totalSpent || '$0.00'}</span>
                       </div>
+                      {userStats && (
+                        <div className="flex justify-between items-center">
+                          <span className="text-text-secondary">User tier</span>
+                          <span className="font-semibold text-primary">{getUserTier(userStats).name}</span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 </>
@@ -222,6 +301,14 @@ function App() {
         />
       </div>
     </div>
+  );
+}
+
+function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
   );
 }
 
